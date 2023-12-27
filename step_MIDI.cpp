@@ -1,84 +1,119 @@
 #include <cstdint>
 #include <thread>
 #include <cmath>
+#include <vector>
 
 #include <pigpio.h>
 
 #include "errorprint.h"
 
+#include "../L6470_pi/Stepper.hpp"
+
+#include "../MIDIfile_io/tone_name.hpp"
+#include "../MIDIfile_io/MIDI_input.hpp"
+
 const uint32_t spi_speed = 1000000;
 const uint8_t spi_ch = 0;
-
 const double spi_ss1_pin = 25;
 
-const int f_sound = 440;
-
-int spi_handle = 0;
-
-void spi_write(int spi_ss1_pin);
-template <typename... type> void spi_write(int SS_pin, char front_data, type... data);
-
-
-
-int main(void)
+class step_MIDI_move
 {
-    system("sudo killall pigpiod");
+private:
+    std::vector<uint8_t> motor_busy_status;//モーターの空き情報
+    tone_name_array tone;//音階名一覧
+    uint32_t tempo_ms = 500;//テンポ(四分音符あたりms)
+    MIDI_input midi;//MIDIクラスを入れておく
 
-    if (gpioInitialise() < 0)
-    {
-        ERROR_EXIT("GPIOの初期化に失敗しました。", -1);
-    }
+public:
+    template <typename... TYPE>
+    step_MIDI_move(MIDI_input midi_class, TYPE... ss_pin);
+    ~step_MIDI_move();
 
-    gpioSetMode(spi_ss1_pin, PI_OUTPUT);
+    void step_play(MIDI_track_data::track_data_format MIDI_data);
 
-    gpioWrite(spi_ss1_pin, PI_HIGH);
+    stepper_motor *motor;
+};
 
-    spi_handle = spiOpen(spi_ch, spi_speed, 0);
+template <typename... TYPE>
+step_MIDI_move::step_MIDI_move(MIDI_input midi_class, TYPE... ss_pin)
+{
+    motor = new stepper_motor(spi_speed, spi_ch, ss_pin...);//ステッピングモーター駆動クラスを定義
+    motor_busy_status.resize(motor->get_motor_num() + 1);//モーター状態管理配列を生成
 
-    if (spi_handle < 0)
-    {
-        ERROR_EXIT("SPIの初期化に失敗しました。", -2);
-    }
+    midi = midi_class;
 
-    spi_write(spi_ss1_pin, 0x00, 0x00, 0x00, 0x00);
+    for (int i = 0; i < midi.heard_data->MIDI_track_num; i++)//MIDIファイルを読んでテンポ情報を探す
+    {//トラック数ぶん回す
+        for (int j = 0; j < midi.track_data.size(); j++)
+        {//データの数だけ回す
 
-    spi_write(spi_ss1_pin, 0x05,0x02,0x20);
-    spi_write(spi_ss1_pin, 0x06,0x02,0x20);
-    spi_write(spi_ss1_pin, 0x07,0x01,0xC4);
-    spi_write(spi_ss1_pin, 0x08,0x00,0x00);
-    
-    spi_write(spi_ss1_pin, 0x0A,0xFF);
-    spi_write(spi_ss1_pin, 0x0B,0xFF);
-    spi_write(spi_ss1_pin, 0x0C,0xFF);
-
-    spi_write(spi_ss1_pin, 0x13,0x0F);
-
-    spi_write(spi_ss1_pin, 0x0A, 0xff);
-    spi_write(spi_ss1_pin, 0x16, 0x00);
-
-    while (1)
-    {
-        for (int i = 0; i < 1; i++)
-        {
-            spi_write(spi_ss1_pin, 0x51, ((int)(66 * (double)f_sound * std::pow(2, i)) >> 16) & 0xff, ((int)(66 * (double)f_sound * std::pow(2, i)) >> 8) & 0xff, (int)(66 * (double)f_sound * std::pow(2, i)) & 0xff);
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            MIDI_track_data::track_data_format buf = midi.track_data[i]->get_track_data(j);
+            if (buf.event_data[0] == 0x51 && buf.event_data[1] == 0x03)
+            {//テンポ情報なら上書き
+                for (int k = 0; k < 3; k++)
+                {
+                    tempo_ms += buf.event_data[2 + k] << (16 - 8 * k);
+                }
+            }
         }
     }
-
-    spiClose(spi_handle);
-    gpioTerminate();
 }
 
-template <typename... type> void spi_write(int SS_pin, char front_data, type... data)
+step_MIDI_move::~step_MIDI_move()
 {
-    gpioWrite(SS_pin, PI_LOW);
-    spiWrite(spi_handle, &front_data, sizeof(char));
-    gpioWrite(SS_pin, PI_HIGH);
-
-    spi_write(SS_pin, data...);
+    delete motor;
 }
 
-void spi_write(int SS_pin)
+void step_MIDI_move::step_play(MIDI_track_data::track_data_format MIDI_data)
 {
-    return;
+    switch (MIDI_data.event_data[0] & 0xf0)
+    {
+    case 0x80://止める指令
+        for (int i = 0; i < motor_busy_status.size(); i++)
+        {
+            if (motor_busy_status[i] == MIDI_data.event_data[1])//指定の音を鳴らしているモーターがあれば止める
+            {   
+                motor_busy_status[i] = 0;
+                std::this_thread::sleep_for(std::chrono::milliseconds(tempo_ms * ((double)MIDI_data.time / midi.heard_data->resolution)));
+                motor->spi_write(i, 0x51, ((int)(66 * (double)tone[MIDI_data.event_data[1]]) >> 16) & 0xff, ((int)(66 * (double)tone[MIDI_data.event_data[1]]) >> 8) & 0xff, (int)(66 * (double)tone[MIDI_data.event_data[1]]) & 0xff);
+                
+                break;
+            }
+        }
+        break;
+
+    case 0x90://鳴らす指令
+        for (int i = 0; i < motor_busy_status.size(); i++)
+        {
+            motor_busy_status.back() = 0;//free(溢れたときの予備)をリセット
+            if (motor_busy_status[i] == 0)//空いていれば音階情報を入れて回す
+            {
+                motor_busy_status[i] = MIDI_data.event_data[1];
+                std::this_thread::sleep_for(std::chrono::milliseconds(tempo_ms * ((double)MIDI_data.time / midi.heard_data->resolution)));
+
+                motor->spi_write(i, 0x51, 0x00, 0x00, 0x00);
+                break;
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+int main(int argc, char **argv)
+{
+    MIDI_input midi(argv[1]);
+
+    step_MIDI_move step(midi, spi_ss1_pin);
+
+    for(int i=0;;i++){
+        MIDI_track_data::track_data_format buf = midi.get_MIDI_data(0,i);
+        if(buf.data_size == 0){
+            break;
+        }
+
+        step.step_play(buf);
+    }
 }

@@ -18,6 +18,8 @@ int spi_handle = 0;
 void spi_write(int spi_ss1_pin);
 template <typename... type> void spi_write(int SS_pin, char front_data, type... data);
 
+
+
 int main(void)
 {
     system("sudo killall pigpiod");
